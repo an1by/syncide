@@ -11,6 +11,7 @@ const linker = syncide.linker;
 const extensions = syncide.extensions;
 const state_mod = syncide.state;
 const syncer = syncide.syncer;
+const updater = syncide.updater;
 
 fn printHelp(w: *Io.Writer) !void {
     try w.writeAll(
@@ -23,8 +24,12 @@ fn printHelp(w: *Io.Writer) !void {
         \\  syncide extension list                   List shared extensions (alias: ext ls, --list-extensions)
         \\  syncide extension install <id...>        Install extension(s) to shared store (alias: ext -i, --install-extension)
         \\  syncide extension uninstall <id...>      Remove extension(s) from shared store (alias: ext -u, --uninstall-extension)
-        \\  syncide clean-backups [-f] [ide-id...]   Delete syncide .zip backups with confirmation or --force (alias: clean)
+        \\  syncide backups create [ide-id...|all]   Create compressed .zip backups and print archive paths
+        \\  syncide backups clean [-f] [ide-id...]   Delete syncide .zip backups with confirmation or --force
+        \\  syncide backups list [ide-id...|all]     List existing .zip backups and sizes (default for 'backups')
         \\  syncide unlink <ide-id...|all>           Detach IDE(s) back into standalone copies
+        \\  syncide update [-f] [--check]            Self-update syncide binary from GitHub Releases
+        \\  syncide --version                        Print installed syncide version
         \\
         \\Init Options:
         \\  --primary <id>       Primary IDE id (e.g. code, cursor, trae, antigravity)
@@ -32,6 +37,15 @@ fn printHelp(w: *Io.Writer) !void {
         \\  --store <dir>        Custom central store directory (default: AppData/syncide or ~/.config/syncide)
         \\  --merge              Merge unique extensions from non-primary IDEs into store
         \\  -y, --yes            Non-interactive confirmation
+        \\
+        \\Backups Options:
+        \\  -f, --force          Skip confirmation prompt in 'syncide backups clean'
+        \\  --store <dir>        Explicit central store directory
+        \\
+        \\Update Options:
+        \\  --check              Check whether a newer release is available without installing
+        \\  --version <tag>      Install a specific release version (e.g. v0.3.0)
+        \\  -f, --force          Reinstall even if already on the latest version
         \\
         \\Extension Options:
         \\  -l, --list-extensions          List installed extensions in shared store
@@ -703,92 +717,346 @@ fn handleUnlink(
     });
 }
 
-fn handleCleanBackups(
+const BackupsSubcommand = enum {
+    list,
+    create,
+    clean,
+};
+
+fn appendCreatedZipInfo(
     arena: Allocator,
     io: Io,
+    label: []const u8,
+    zip_path_opt: ?[]const u8,
+    out_list: *std.ArrayList(archive.BackupArchiveInfo),
+) !void {
+    const zp = zip_path_opt orelse return;
+    const st = Io.Dir.cwd().statFile(io, zp, .{ .follow_symlinks = false }) catch return;
+    try out_list.append(arena, .{
+        .ide_name = label,
+        .path = zp,
+        .size = st.size,
+    });
+}
+
+fn handleBackups(
+    arena: Allocator,
+    gpa: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
     out: *Io.Writer,
     p: types.PlatformPaths,
     args: []const []const u8,
 ) !void {
     var force_flag = false;
-    var ide_filters: std.ArrayList([]const u8) = .empty;
+    var store_arg: ?[]const u8 = null;
+    var positionals: std.ArrayList([]const u8) = .empty;
 
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
             force_flag = true;
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            i += 1;
+            if (i >= args.len) {
+                return error.MissingOptionValue;
+            }
+            store_arg = try paths.resolveUserInputPath(arena, io, args[i]);
         } else if (arg.len > 0 and arg[0] == '-') {
             return error.UnknownOption;
-        } else if (!std.ascii.eqlIgnoreCase(arg, "all")) {
-            try ide_filters.append(arena, arg);
+        } else {
+            try positionals.append(arena, arg);
         }
     }
 
+    var action: BackupsSubcommand = .list;
+    var filter_slice: []const []const u8 = &.{};
+
+    if (positionals.items.len > 0) {
+        const sub = positionals.items[0];
+        filter_slice = positionals.items[1..];
+        if (std.ascii.eqlIgnoreCase(sub, "create") or
+            std.ascii.eqlIgnoreCase(sub, "new") or
+            std.ascii.eqlIgnoreCase(sub, "make") or
+            std.ascii.eqlIgnoreCase(sub, "add"))
+        {
+            action = .create;
+        } else if (std.ascii.eqlIgnoreCase(sub, "clean") or
+            std.ascii.eqlIgnoreCase(sub, "rm") or
+            std.ascii.eqlIgnoreCase(sub, "remove") or
+            std.ascii.eqlIgnoreCase(sub, "delete") or
+            std.ascii.eqlIgnoreCase(sub, "prune") or
+            std.ascii.eqlIgnoreCase(sub, "clear"))
+        {
+            action = .clean;
+        } else if (std.ascii.eqlIgnoreCase(sub, "list") or std.ascii.eqlIgnoreCase(sub, "ls")) {
+            action = .list;
+        } else {
+            return error.UnknownBackupsAction;
+        }
+    }
+
+    const st_opt = try state_mod.loadState(arena, io, p, store_arg);
+    const effective_store_dir: ?[]const u8 = store_arg orelse if (st_opt) |s| s.storeDir else null;
     const discovered = try discovery.discoverIdes(arena, io, p);
+
+    var all_mode = (filter_slice.len == 0);
+    for (filter_slice) |flt| {
+        if (std.ascii.eqlIgnoreCase(flt, "all")) {
+            all_mode = true;
+            break;
+        }
+    }
+
+    var include_store = false;
     var targets: std.ArrayList(types.IdeInstallation) = .empty;
 
-    if (ide_filters.items.len == 0) {
+    if (all_mode) {
+        include_store = (effective_store_dir != null);
         try targets.appendSlice(arena, discovered);
     } else {
+        for (filter_slice) |flt| {
+            if (std.ascii.eqlIgnoreCase(flt, "store")) {
+                include_store = true;
+            }
+        }
         for (discovered) |ide| {
-            for (ide_filters.items) |flt| {
+            for (filter_slice) |flt| {
                 if (std.ascii.eqlIgnoreCase(ide.id, flt)) {
                     try targets.append(arena, ide);
                     break;
                 }
             }
         }
-        if (targets.items.len == 0) {
+        if (!include_store and targets.items.len == 0) {
             return error.NoMatchingIdeFound;
         }
     }
 
-    const backups = try archive.findIdeBackups(arena, io, targets.items);
-    if (backups.len == 0) {
-        try out.writeAll("No syncide backup archives (.zip) found.\n");
-        return;
+    switch (action) {
+        .list => {
+            const scan_store = if (include_store) effective_store_dir else null;
+            const backups = try archive.findBackups(arena, io, targets.items, scan_store);
+            if (backups.len == 0) {
+                try out.writeAll("No syncide backup archives (.zip) found.\n");
+                return;
+            }
+
+            var total_bytes: u64 = 0;
+            for (backups) |b| {
+                total_bytes += b.size;
+            }
+            var total_buf: [32]u8 = undefined;
+            const total_str = paths.formatBytesBuf(total_bytes, &total_buf);
+            try out.print("Found {d} backup archive(s) ({s} total):\n", .{ backups.len, total_str });
+            for (backups) |b| {
+                var sz_buf: [32]u8 = undefined;
+                const sz_str = paths.formatBytesBuf(b.size, &sz_buf);
+                try out.print("  * [{s:>8}] {s}\n", .{ sz_str, b.path });
+            }
+        },
+        .clean => {
+            const scan_store = if (include_store) effective_store_dir else null;
+            const backups = try archive.findBackups(arena, io, targets.items, scan_store);
+            if (backups.len == 0) {
+                try out.writeAll("No syncide backup archives (.zip) found.\n");
+                return;
+            }
+
+            var total_bytes: u64 = 0;
+            for (backups) |b| {
+                total_bytes += b.size;
+            }
+
+            var total_buf: [32]u8 = undefined;
+            const total_str = paths.formatBytesBuf(total_bytes, &total_buf);
+            try out.print("Found {d} backup archive(s) ({s} total):\n", .{ backups.len, total_str });
+
+            for (backups) |b| {
+                var sz_buf: [32]u8 = undefined;
+                const sz_str = paths.formatBytesBuf(b.size, &sz_buf);
+                try out.print("  - [{s:>8}] {s}\n", .{ sz_str, b.path });
+            }
+            try out.writeByte('\n');
+
+            if (!force_flag) {
+                const prompt_msg = try std.fmt.allocPrint(
+                    arena,
+                    "Permanently delete {d} backup archive(s) ({s})? This cannot be undone",
+                    .{ backups.len, total_str },
+                );
+                if (!(try askConfirm(arena, io, out, prompt_msg, false))) {
+                    try out.writeAll("Aborted. Backups kept intact.\n");
+                    return;
+                }
+            }
+
+            const res = archive.deleteBackupArchives(io, backups);
+            var freed_buf: [32]u8 = undefined;
+            const freed_str = paths.formatBytesBuf(res.freed_bytes, &freed_buf);
+            try out.print("Deleted {d} backup archive(s), freed {s}.\n", .{ res.deleted_count, freed_str });
+            if (res.failed_count > 0) {
+                try out.print("Warning: Failed to delete {d} archive(s).\n", .{res.failed_count});
+            }
+        },
+        .create => {
+            try out.writeAll("Creating compressed .zip backups...\n");
+            try out.flush();
+
+            const ts = try archive.makeTimestampSlugAlloc(arena, io);
+            const sp_opt: ?types.StorePaths = if (effective_store_dir) |sd|
+                try paths.getStorePaths(arena, sd)
+            else
+                null;
+
+            var created: std.ArrayList(archive.BackupArchiveInfo) = .empty;
+
+            if (all_mode) {
+                if (sp_opt) |sp| {
+                    const st_user = try archive.backupStoreUserConfig(arena, gpa, io, environ_map, sp, ts);
+                    try appendCreatedZipInfo(arena, io, "shared store", st_user, &created);
+
+                    const st_ext = try archive.backupStoreExtensions(arena, gpa, io, environ_map, sp, ts);
+                    try appendCreatedZipInfo(arena, io, "shared store", st_ext, &created);
+
+                    for (targets.items) |ide| {
+                        const rep = linker.inspectIdeLinks(arena, io, ide, sp);
+                        const skip_shared = rep.settings_state == .linked or
+                            rep.settings_state == .hardlinked or
+                            rep.keybindings_state == .linked or
+                            rep.keybindings_state == .hardlinked;
+
+                        const u_zip = try archive.backupIdeUserConfigCustom(
+                            arena,
+                            gpa,
+                            io,
+                            environ_map,
+                            ide,
+                            ts,
+                            false,
+                            skip_shared,
+                        );
+                        try appendCreatedZipInfo(arena, io, ide.name, u_zip, &created);
+
+                        const e_zip = try archive.backupIdeExtensionsCustom(
+                            arena,
+                            gpa,
+                            io,
+                            environ_map,
+                            ide,
+                            sp,
+                            ts,
+                            false,
+                        );
+                        try appendCreatedZipInfo(arena, io, ide.name, e_zip, &created);
+                    }
+                } else {
+                    for (targets.items) |ide| {
+                        const u_zip = try archive.backupIdeUserConfig(arena, gpa, io, environ_map, ide, ts);
+                        try appendCreatedZipInfo(arena, io, ide.name, u_zip, &created);
+
+                        const e_zip = try archive.backupIdeExtensions(arena, gpa, io, environ_map, ide, ts);
+                        try appendCreatedZipInfo(arena, io, ide.name, e_zip, &created);
+                    }
+                }
+            } else {
+                if (include_store) {
+                    const sp = sp_opt orelse return error.NotInitialized;
+                    const st_user = try archive.backupStoreUserConfig(arena, gpa, io, environ_map, sp, ts);
+                    try appendCreatedZipInfo(arena, io, "shared store", st_user, &created);
+
+                    const st_ext = try archive.backupStoreExtensions(arena, gpa, io, environ_map, sp, ts);
+                    try appendCreatedZipInfo(arena, io, "shared store", st_ext, &created);
+                }
+
+                for (targets.items) |ide| {
+                    const u_zip = try archive.backupIdeUserConfigCustom(
+                        arena,
+                        gpa,
+                        io,
+                        environ_map,
+                        ide,
+                        ts,
+                        true,
+                        false,
+                    );
+                    try appendCreatedZipInfo(arena, io, ide.name, u_zip, &created);
+
+                    const e_zip = try archive.backupIdeExtensionsCustom(
+                        arena,
+                        gpa,
+                        io,
+                        environ_map,
+                        ide,
+                        sp_opt,
+                        ts,
+                        true,
+                    );
+                    try appendCreatedZipInfo(arena, io, ide.name, e_zip, &created);
+                }
+            }
+
+            if (created.items.len == 0) {
+                try out.writeAll("No configurations or extensions found to back up.\n");
+                return;
+            }
+
+            var total_bytes: u64 = 0;
+            for (created.items) |item| {
+                total_bytes += item.size;
+            }
+            var total_buf: [32]u8 = undefined;
+            const total_str = paths.formatBytesBuf(total_bytes, &total_buf);
+            try out.print("Created {d} backup archive(s) ({s} total):\n", .{
+                created.items.len,
+                total_str,
+            });
+            for (created.items) |item| {
+                var sz_buf: [32]u8 = undefined;
+                const sz_str = paths.formatBytesBuf(item.size, &sz_buf);
+                try out.print("  + [{s:>8}] {s}\n", .{ sz_str, item.path });
+            }
+        },
     }
+}
 
-    var total_bytes: u64 = 0;
-    for (backups) |b| {
-        total_bytes += b.size;
-    }
+fn handleUpdate(
+    arena: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    out: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    var opts: updater.UpdateOptions = .{};
 
-    var total_buf: [32]u8 = undefined;
-    const total_str = paths.formatBytesBuf(total_bytes, &total_buf);
-    try out.print("Found {d} backup archive(s) ({s} total):\n", .{ backups.len, total_str });
-
-    for (backups) |b| {
-        var sz_buf: [32]u8 = undefined;
-        const sz_str = paths.formatBytesBuf(b.size, &sz_buf);
-        try out.print("  - [{s:>8}] {s}\n", .{ sz_str, b.path });
-    }
-    try out.writeByte('\n');
-
-    if (!force_flag) {
-        const prompt_msg = try std.fmt.allocPrint(
-            arena,
-            "Permanently delete {d} backup archive(s) ({s})? This cannot be undone",
-            .{ backups.len, total_str },
-        );
-        if (!(try askConfirm(arena, io, out, prompt_msg, false))) {
-            try out.writeAll("Aborted. Backups kept intact.\n");
-            return;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            opts.force = true;
+        } else if (std.mem.eql(u8, arg, "--check")) {
+            opts.check_only = true;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            i += 1;
+            if (i >= args.len) {
+                return error.MissingOptionValue;
+            }
+            opts.target_version = args[i];
+        } else {
+            return error.UnknownOption;
         }
     }
 
-    const res = archive.deleteBackupArchives(io, backups);
-    var freed_buf: [32]u8 = undefined;
-    const freed_str = paths.formatBytesBuf(res.freed_bytes, &freed_buf);
-    try out.print("Deleted {d} backup archive(s), freed {s}.\n", .{ res.deleted_count, freed_str });
-    if (res.failed_count > 0) {
-        try out.print("Warning: Failed to delete {d} archive(s).\n", .{res.failed_count});
-    }
+    try updater.runSelfUpdate(arena, io, environ_map, out, opts);
 }
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
+
+    updater.cleanupOldExecutable(arena, io);
 
     const raw_args = try init.minimal.args.toSlice(arena);
     const cli_args = if (raw_args.len > 1) raw_args[1..] else &[_][]const u8{};
@@ -803,6 +1071,16 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         }
+    }
+
+    if (cli_args.len == 1 and
+        (std.mem.eql(u8, cli_args[0], "-v") or
+            std.mem.eql(u8, cli_args[0], "--version") or
+            std.ascii.eqlIgnoreCase(cli_args[0], "version")))
+    {
+        try out.print("syncide {s}\n", .{updater.VERSION});
+        try out.flush();
+        return;
     }
 
     const p = try paths.resolvePlatformPaths(arena, init.environ_map, .{});
@@ -822,11 +1100,13 @@ pub fn main(init: std.process.Init) !void {
             std.ascii.eqlIgnoreCase(cmd, "ext"))
         {
             break :blk handleExtension(arena, io, init.environ_map, out, p, rest);
-        } else if (std.ascii.eqlIgnoreCase(cmd, "clean-backups") or
-            std.ascii.eqlIgnoreCase(cmd, "clean") or
-            std.ascii.eqlIgnoreCase(cmd, "prune-backups"))
+        } else if (std.ascii.eqlIgnoreCase(cmd, "backups") or std.ascii.eqlIgnoreCase(cmd, "backup")) {
+            break :blk handleBackups(arena, gpa, io, init.environ_map, out, p, rest);
+        } else if (std.ascii.eqlIgnoreCase(cmd, "update") or
+            std.ascii.eqlIgnoreCase(cmd, "self-update") or
+            std.ascii.eqlIgnoreCase(cmd, "upgrade"))
         {
-            break :blk handleCleanBackups(arena, io, out, p, rest);
+            break :blk handleUpdate(arena, io, init.environ_map, out, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "unlink")) {
             break :blk handleUnlink(arena, io, out, p, rest);
         } else {
@@ -840,6 +1120,18 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         if (err == error.NotInitialized) {
             std.debug.print("Error: syncide is not initialized yet. Run 'syncide init' first.\n", .{});
+        } else if (err == error.UnknownBackupsAction) {
+            std.debug.print(
+                "Error: Unknown backups subcommand. Expected 'syncide backups create', 'syncide backups clean', or 'syncide backups list'.\n",
+                .{},
+            );
+        } else if (err == error.UpdatePermissionDenied) {
+            std.debug.print(
+                "Error: Permission denied updating syncide executable. Re-run from an elevated terminal (or sudo).\n",
+                .{},
+            );
+        } else if (err == error.ChecksumMismatch) {
+            std.debug.print("Error: SHA-256 checksum verification failed! Aborting update.\n", .{});
         } else {
             std.debug.print("Error: {s}\n", .{@errorName(err)});
         }

@@ -8,6 +8,12 @@ pub const linker = @import("linker.zig");
 pub const extensions = @import("extensions.zig");
 pub const state = @import("state.zig");
 pub const syncer = @import("syncer.zig");
+pub const updater = @import("updater.zig");
+pub const VERSION = updater.VERSION;
+
+test {
+    _ = updater;
+}
 
 fn writeDummyExt(
     arena: std.mem.Allocator,
@@ -166,8 +172,46 @@ test "end-to-end discovery, zip backups, junction/symlink live sync, broken link
     const after_backups = try archive.findIdeBackups(arena, io, ides);
     try std.testing.expectEqual(@as(usize, 0), after_backups.len);
 
-    // Test standalone unlink
+    // Test manual backup creation on linked store + linked IDE (backups create)
     const store_paths = try paths.getStorePaths(arena, custom_store);
+    const manual_ts = "20261114-120000";
+    const st_u_zip = try archive.backupStoreUserConfig(arena, gpa, io, &env_map, store_paths, manual_ts);
+    const st_e_zip = try archive.backupStoreExtensions(arena, gpa, io, &env_map, store_paths, manual_ts);
+    try std.testing.expect(st_u_zip != null and st_e_zip != null);
+
+    const linked_u_zip = try archive.backupIdeUserConfigCustom(
+        arena,
+        gpa,
+        io,
+        &env_map,
+        cursor_ide.?,
+        manual_ts,
+        true,
+        false,
+    );
+    const linked_e_zip = try archive.backupIdeExtensionsCustom(
+        arena,
+        gpa,
+        io,
+        &env_map,
+        cursor_ide.?,
+        store_paths,
+        manual_ts,
+        true,
+    );
+    try std.testing.expect(linked_u_zip != null and linked_e_zip != null);
+
+    const manual_found = try archive.findBackups(arena, io, ides, custom_store);
+    try std.testing.expectEqual(@as(usize, 4), manual_found.len);
+
+    // Verify streaming SHA-256 helper on real zip file
+    const zip_hash = try updater.computeFileSha256Hex(io, st_e_zip.?);
+    try std.testing.expectEqual(@as(usize, 64), zip_hash.len);
+
+    const manual_del = archive.deleteBackupArchives(io, manual_found);
+    try std.testing.expectEqual(@as(usize, 4), manual_del.deleted_count);
+
+    // Test standalone unlink
     try linker.unlinkIde(arena, io, code_ide.?, store_paths);
     const code_ext_stat = try std.Io.Dir.cwd().statFile(io, code_ide.?.extensions_dir, .{ .follow_symlinks = false });
     try std.testing.expectEqual(std.Io.File.Kind.directory, code_ext_stat.kind);

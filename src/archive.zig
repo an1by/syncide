@@ -388,6 +388,187 @@ const USER_BACKUP_CANDIDATES = [_][]const u8{
     "snippets",
 };
 
+fn uniqueBackupZipPathAlloc(
+    arena: Allocator,
+    io: Io,
+    dir_path: []const u8,
+    category: []const u8,
+    ts_slug: []const u8,
+) ![]const u8 {
+    const base_name = try std.fmt.allocPrint(arena, "syncide-backup-{s}-{s}.zip", .{ category, ts_slug });
+    const base_path = try Dir.path.join(arena, &.{ dir_path, base_name });
+    if (Dir.accessAbsolute(io, base_path, .{})) |_| {} else |_| {
+        return base_path;
+    }
+
+    var suffix: usize = 2;
+    while (suffix <= 999) : (suffix += 1) {
+        const alt_name = try std.fmt.allocPrint(
+            arena,
+            "syncide-backup-{s}-{s}-{d}.zip",
+            .{ category, ts_slug, suffix },
+        );
+        const alt_path = try Dir.path.join(arena, &.{ dir_path, alt_name });
+        if (Dir.accessAbsolute(io, alt_path, .{})) |_| {} else |_| {
+            return alt_path;
+        }
+    }
+    return base_path;
+}
+
+fn copyTreeFollowingSymlinks(
+    arena: Allocator,
+    io: Io,
+    src_path: []const u8,
+    dst_path: []const u8,
+) !void {
+    const st = Dir.cwd().statFile(io, src_path, .{ .follow_symlinks = true }) catch return;
+    if (st.kind == .file) {
+        if (Dir.path.dirname(dst_path)) |parent| {
+            try Dir.cwd().createDirPath(io, parent);
+        }
+        const bytes = try Dir.cwd().readFileAlloc(io, src_path, arena, .limited(128 * 1024 * 1024));
+        try Dir.cwd().writeFile(io, .{ .sub_path = dst_path, .data = bytes });
+        return;
+    }
+    if (st.kind == .directory) {
+        try Dir.cwd().createDirPath(io, dst_path);
+        var dir = Dir.openDirAbsolute(io, src_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            const child_src = try Dir.path.join(arena, &.{ src_path, entry.name });
+            const child_dst = try Dir.path.join(arena, &.{ dst_path, entry.name });
+            try copyTreeFollowingSymlinks(arena, io, child_src, child_dst);
+        }
+    }
+}
+
+fn dirHasEntries(io: Io, dir_path: []const u8) bool {
+    var dir = Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    return (it.next(io) catch null) != null;
+}
+
+pub fn backupStoreUserConfig(
+    arena: Allocator,
+    gpa: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    store: types.StorePaths,
+    ts_slug: []const u8,
+) !?[]const u8 {
+    var rel_targets: std.ArrayList([]const u8) = .empty;
+    for (USER_BACKUP_CANDIDATES) |cand| {
+        const abs_cand = try Dir.path.join(arena, &.{ store.user_dir, cand });
+        const st = Dir.cwd().statFile(io, abs_cand, .{ .follow_symlinks = false }) catch continue;
+        if (st.kind == .file or st.kind == .directory) {
+            const rel = try Dir.path.join(arena, &.{ "User", cand });
+            try rel_targets.append(arena, rel);
+        }
+    }
+    if (rel_targets.items.len == 0) {
+        return null;
+    }
+
+    const zip_path = try uniqueBackupZipPathAlloc(arena, io, store.store_dir, "user", ts_slug);
+    try createCompressedZip(gpa, io, environ_map, zip_path, store.store_dir, rel_targets.items);
+    return zip_path;
+}
+
+pub fn backupStoreExtensions(
+    arena: Allocator,
+    gpa: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    store: types.StorePaths,
+    ts_slug: []const u8,
+) !?[]const u8 {
+    const st = Dir.cwd().statFile(io, store.extensions_dir, .{ .follow_symlinks = false }) catch return null;
+    if (st.kind != .directory or !dirHasEntries(io, store.extensions_dir)) {
+        return null;
+    }
+
+    const ext_base = Dir.path.basename(store.extensions_dir);
+    const zip_path = try uniqueBackupZipPathAlloc(arena, io, store.store_dir, "extensions", ts_slug);
+    try createCompressedZip(gpa, io, environ_map, zip_path, store.store_dir, &.{ext_base});
+    return zip_path;
+}
+
+pub fn backupIdeUserConfigCustom(
+    arena: Allocator,
+    gpa: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    ide: types.IdeInstallation,
+    ts_slug: []const u8,
+    include_linked: bool,
+    skip_shared_files: bool,
+) !?[]const u8 {
+    var rel_targets: std.ArrayList([]const u8) = .empty;
+    var found_cands: std.ArrayList([]const u8) = .empty;
+    var has_symlink = false;
+
+    for (USER_BACKUP_CANDIDATES) |cand| {
+        if (skip_shared_files and
+            (std.mem.eql(u8, cand, "settings.json") or std.mem.eql(u8, cand, "keybindings.json")))
+        {
+            continue;
+        }
+
+        const abs_cand = try Dir.path.join(arena, &.{ ide.user_dir, cand });
+        const raw_st = Dir.cwd().statFile(io, abs_cand, .{ .follow_symlinks = false }) catch continue;
+
+        if (!include_linked) {
+            if (raw_st.kind == .file or raw_st.kind == .directory) {
+                const rel = try Dir.path.join(arena, &.{ "User", cand });
+                try rel_targets.append(arena, rel);
+            }
+        } else {
+            const eff_st = if (raw_st.kind == .sym_link)
+                (Dir.cwd().statFile(io, abs_cand, .{ .follow_symlinks = true }) catch continue)
+            else
+                raw_st;
+
+            if (eff_st.kind == .file or eff_st.kind == .directory) {
+                if (raw_st.kind == .sym_link) {
+                    has_symlink = true;
+                }
+                const rel = try Dir.path.join(arena, &.{ "User", cand });
+                try rel_targets.append(arena, rel);
+                try found_cands.append(arena, cand);
+            }
+        }
+    }
+
+    if (rel_targets.items.len == 0) {
+        return null;
+    }
+
+    const zip_path = try uniqueBackupZipPathAlloc(arena, io, ide.app_dir, "user", ts_slug);
+
+    if (!has_symlink) {
+        try createCompressedZip(gpa, io, environ_map, zip_path, ide.app_dir, rel_targets.items);
+        return zip_path;
+    }
+
+    const ns = Io.Clock.awake.now(io).nanoseconds;
+    const stage_name = try std.fmt.allocPrint(arena, ".syncide-user-stage-{d}", .{ns});
+    const stage_dir = try Dir.path.join(arena, &.{ ide.app_dir, stage_name });
+    defer Dir.cwd().deleteTree(io, stage_dir) catch {};
+
+    for (found_cands.items) |cand| {
+        const src_p = try Dir.path.join(arena, &.{ ide.user_dir, cand });
+        const dst_p = try Dir.path.join(arena, &.{ stage_dir, "User", cand });
+        try copyTreeFollowingSymlinks(arena, io, src_p, dst_p);
+    }
+
+    try createCompressedZip(gpa, io, environ_map, zip_path, stage_dir, rel_targets.items);
+    return zip_path;
+}
+
 pub fn backupIdeUserConfig(
     arena: Allocator,
     gpa: Allocator,
@@ -396,25 +577,58 @@ pub fn backupIdeUserConfig(
     ide: types.IdeInstallation,
     ts_slug: []const u8,
 ) !?[]const u8 {
-    var rel_targets: std.ArrayList([]const u8) = .empty;
+    return backupIdeUserConfigCustom(arena, gpa, io, environ_map, ide, ts_slug, false, false);
+}
 
-    for (USER_BACKUP_CANDIDATES) |cand| {
-        const abs_cand = try Dir.path.join(arena, &.{ ide.user_dir, cand });
-        const st = Dir.cwd().statFile(io, abs_cand, .{ .follow_symlinks = false }) catch continue;
-        if (st.kind == .file or st.kind == .directory) {
-            const rel = try Dir.path.join(arena, &.{ "User", cand });
-            try rel_targets.append(arena, rel);
+pub fn backupIdeExtensionsCustom(
+    arena: Allocator,
+    gpa: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    ide: types.IdeInstallation,
+    store_opt: ?types.StorePaths,
+    ts_slug: []const u8,
+    include_linked: bool,
+) !?[]const u8 {
+    const raw_st = Dir.cwd().statFile(io, ide.extensions_dir, .{ .follow_symlinks = false }) catch return null;
+
+    if (raw_st.kind == .directory) {
+        if (!dirHasEntries(io, ide.extensions_dir)) {
+            return null;
         }
+        const ext_base = Dir.path.basename(ide.extensions_dir);
+        const zip_path = try uniqueBackupZipPathAlloc(arena, io, ide.dot_dir, "extensions", ts_slug);
+        try createCompressedZip(gpa, io, environ_map, zip_path, ide.dot_dir, &.{ext_base});
+        return zip_path;
     }
 
-    if (rel_targets.items.len == 0) {
-        return null;
+    if (include_linked and raw_st.kind == .sym_link) {
+        if (!dirHasEntries(io, ide.extensions_dir)) {
+            return null;
+        }
+        const zip_path = try uniqueBackupZipPathAlloc(arena, io, ide.dot_dir, "extensions", ts_slug);
+
+        if (store_opt) |sp| {
+            const sp_st = Dir.cwd().statFile(io, sp.extensions_dir, .{ .follow_symlinks = false }) catch null;
+            if (sp_st != null and sp_st.?.kind == .directory) {
+                const ext_base = Dir.path.basename(sp.extensions_dir);
+                try createCompressedZip(gpa, io, environ_map, zip_path, sp.store_dir, &.{ext_base});
+                return zip_path;
+            }
+        }
+
+        const ns = Io.Clock.awake.now(io).nanoseconds;
+        const stage_name = try std.fmt.allocPrint(arena, ".syncide-ext-stage-{d}", .{ns});
+        const stage_dir = try Dir.path.join(arena, &.{ ide.dot_dir, stage_name });
+        defer Dir.cwd().deleteTree(io, stage_dir) catch {};
+
+        const staged_ext = try Dir.path.join(arena, &.{ stage_dir, "extensions" });
+        try copyTreeFollowingSymlinks(arena, io, ide.extensions_dir, staged_ext);
+        try createCompressedZip(gpa, io, environ_map, zip_path, stage_dir, &.{"extensions"});
+        return zip_path;
     }
 
-    const zip_name = try std.fmt.allocPrint(arena, "syncide-backup-user-{s}.zip", .{ts_slug});
-    const zip_path = try Dir.path.join(arena, &.{ ide.app_dir, zip_name });
-    try createCompressedZip(gpa, io, environ_map, zip_path, ide.app_dir, rel_targets.items);
-    return zip_path;
+    return null;
 }
 
 pub fn backupIdeExtensions(
@@ -425,29 +639,7 @@ pub fn backupIdeExtensions(
     ide: types.IdeInstallation,
     ts_slug: []const u8,
 ) !?[]const u8 {
-    const st = Dir.cwd().statFile(io, ide.extensions_dir, .{ .follow_symlinks = false }) catch return null;
-    if (st.kind != .directory) {
-        return null;
-    }
-
-    var dir = Dir.openDirAbsolute(io, ide.extensions_dir, .{ .iterate = true }) catch return null;
-    var has_any = false;
-    {
-        defer dir.close(io);
-        var it = dir.iterate();
-        if ((it.next(io) catch null) != null) {
-            has_any = true;
-        }
-    }
-    if (!has_any) {
-        return null;
-    }
-
-    const ext_base = Dir.path.basename(ide.extensions_dir);
-    const zip_name = try std.fmt.allocPrint(arena, "syncide-backup-extensions-{s}.zip", .{ts_slug});
-    const zip_path = try Dir.path.join(arena, &.{ ide.dot_dir, zip_name });
-    try createCompressedZip(gpa, io, environ_map, zip_path, ide.dot_dir, &.{ext_base});
-    return zip_path;
+    return backupIdeExtensionsCustom(arena, gpa, io, environ_map, ide, null, ts_slug, false);
 }
 
 pub const BackupArchiveInfo = struct {
@@ -495,10 +687,11 @@ fn scanDirForBackups(
     }
 }
 
-pub fn findIdeBackups(
+pub fn findBackups(
     arena: Allocator,
     io: Io,
     ides: []const types.IdeInstallation,
+    extra_store_dir: ?[]const u8,
 ) ![]BackupArchiveInfo {
     var results: std.ArrayList(BackupArchiveInfo) = .empty;
     var seen_dirs: std.ArrayList([]const u8) = .empty;
@@ -514,6 +707,12 @@ pub fn findIdeBackups(
             return true;
         }
     }.checkAndAdd;
+
+    if (extra_store_dir) |store_dir| {
+        if (try addUniqueDir(arena, &seen_dirs, store_dir)) {
+            try scanDirForBackups(arena, io, "shared store", store_dir, &results);
+        }
+    }
 
     for (ides) |ide| {
         if (try addUniqueDir(arena, &seen_dirs, ide.app_dir)) {
@@ -531,6 +730,14 @@ pub fn findIdeBackups(
     }.lessThan);
 
     return results.toOwnedSlice(arena);
+}
+
+pub fn findIdeBackups(
+    arena: Allocator,
+    io: Io,
+    ides: []const types.IdeInstallation,
+) ![]BackupArchiveInfo {
+    return findBackups(arena, io, ides, null);
 }
 
 pub fn deleteBackupArchives(io: Io, backups: []const BackupArchiveInfo) DeleteBackupsResult {

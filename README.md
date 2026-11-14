@@ -60,10 +60,21 @@ syncide extension list
 syncide extension install esbenp.prettier-vscode
 syncide extension uninstall esbenp.prettier-vscode
 
-# Remove .zip backup archives across IDEs (asks [y/N] confirmation unless -f/--force)
-syncide clean-backups
-syncide clean-backups -f
-syncide clean-backups -f cursor
+# Create compressed .zip backups and print created archive paths
+syncide backups create
+syncide backups create cursor
+
+# List existing .zip backup archives and sizes
+syncide backups list
+
+# Remove .zip backup archives (asks [y/N] confirmation unless -f/--force)
+syncide backups clean
+syncide backups clean -f
+syncide backups clean -f cursor
+
+# Self-update syncide binary from GitHub Releases (verifies SHA-256)
+syncide update
+syncide update --check
 
 # Safely detach an IDE back into standalone copies
 syncide unlink cursor
