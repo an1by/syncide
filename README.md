@@ -2,6 +2,20 @@
 
 Tiny, zero-dependency CLI utility written in **Zig** to share `settings.json`, `keybindings.json`, and `extensions/` across all Visual Studio Code–based IDEs (VS Code, Cursor, Windsurf, Trae, VSCodium, Antigravity, Positron, Void, Kiro, and custom forks) without duplicating disk space.
 
+## Installation
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/an1by/syncide/main/install.ps1 | iex
+```
+
+**Linux & macOS:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/an1by/syncide/main/install.sh | sh
+```
+
 ## Features
 
 - **Automatic IDE Discovery**: Detects installed VS Code forks across Windows (`%APPDATA%` / `%USERPROFILE%`), Linux (`$XDG_CONFIG_HOME` / `~/.config` / `$HOME`), and macOS (`~/Library/Application Support`), ignoring backup/non-VSCode directories.
