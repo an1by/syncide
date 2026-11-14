@@ -16,6 +16,22 @@ irm https://raw.githubusercontent.com/an1by/syncide/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/an1by/syncide/main/install.sh | sh
 ```
 
+### Uninstall
+
+Safely detaches all linked IDEs back into standalone copies (`syncide unlink all`), cleans `PATH`, and removes `syncide`:
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/an1by/syncide/main/uninstall.ps1 | iex
+```
+
+**Linux & macOS:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/an1by/syncide/main/uninstall.sh | sh
+```
+
 ## Features
 
 - **Automatic IDE Discovery**: Detects installed VS Code forks across Windows (`%APPDATA%` / `%USERPROFILE%`), Linux (`$XDG_CONFIG_HOME` / `~/.config` / `$HOME`), and macOS (`~/Library/Application Support`), ignoring backup/non-VSCode directories.
