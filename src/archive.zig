@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const paths = @import("paths.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -448,3 +449,108 @@ pub fn backupIdeExtensions(
     try createCompressedZip(gpa, io, environ_map, zip_path, ide.dot_dir, &.{ext_base});
     return zip_path;
 }
+
+pub const BackupArchiveInfo = struct {
+    ide_name: []const u8,
+    path: []const u8,
+    size: u64,
+};
+
+pub const DeleteBackupsResult = struct {
+    deleted_count: usize,
+    freed_bytes: u64,
+    failed_count: usize,
+};
+
+pub fn isSyncideBackupZip(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "syncide-backup-") and
+        std.ascii.endsWithIgnoreCase(name, ".zip");
+}
+
+fn scanDirForBackups(
+    arena: Allocator,
+    io: Io,
+    ide_name: []const u8,
+    dir_path: []const u8,
+    out: *std.ArrayList(BackupArchiveInfo),
+) !void {
+    var dir = Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !isSyncideBackupZip(entry.name)) {
+            continue;
+        }
+        const full_path = try Dir.path.join(arena, &.{ dir_path, entry.name });
+        const st = Dir.cwd().statFile(io, full_path, .{ .follow_symlinks = false }) catch continue;
+        if (st.kind != .file) {
+            continue;
+        }
+        try out.append(arena, .{
+            .ide_name = ide_name,
+            .path = full_path,
+            .size = st.size,
+        });
+    }
+}
+
+pub fn findIdeBackups(
+    arena: Allocator,
+    io: Io,
+    ides: []const types.IdeInstallation,
+) ![]BackupArchiveInfo {
+    var results: std.ArrayList(BackupArchiveInfo) = .empty;
+    var seen_dirs: std.ArrayList([]const u8) = .empty;
+
+    const addUniqueDir = struct {
+        fn checkAndAdd(alloc: Allocator, seen: *std.ArrayList([]const u8), dir_p: []const u8) !bool {
+            for (seen.items) |existing| {
+                if (paths.pathsEqual(existing, dir_p)) {
+                    return false;
+                }
+            }
+            try seen.append(alloc, dir_p);
+            return true;
+        }
+    }.checkAndAdd;
+
+    for (ides) |ide| {
+        if (try addUniqueDir(arena, &seen_dirs, ide.app_dir)) {
+            try scanDirForBackups(arena, io, ide.name, ide.app_dir, &results);
+        }
+        if (try addUniqueDir(arena, &seen_dirs, ide.dot_dir)) {
+            try scanDirForBackups(arena, io, ide.name, ide.dot_dir, &results);
+        }
+    }
+
+    std.mem.sort(BackupArchiveInfo, results.items, {}, struct {
+        fn lessThan(_: void, a: BackupArchiveInfo, b: BackupArchiveInfo) bool {
+            return std.mem.order(u8, a.path, b.path) == .lt;
+        }
+    }.lessThan);
+
+    return results.toOwnedSlice(arena);
+}
+
+pub fn deleteBackupArchives(io: Io, backups: []const BackupArchiveInfo) DeleteBackupsResult {
+    var deleted_count: usize = 0;
+    var freed_bytes: u64 = 0;
+    var failed_count: usize = 0;
+
+    for (backups) |b| {
+        if (Dir.deleteFileAbsolute(io, b.path)) |_| {
+            deleted_count += 1;
+            freed_bytes += b.size;
+        } else |_| {
+            failed_count += 1;
+        }
+    }
+
+    return .{
+        .deleted_count = deleted_count,
+        .freed_bytes = freed_bytes,
+        .failed_count = failed_count,
+    };
+}
+

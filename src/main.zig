@@ -6,6 +6,7 @@ const Io = std.Io;
 const types = syncide.types;
 const paths = syncide.paths;
 const discovery = syncide.discovery;
+const archive = syncide.archive;
 const linker = syncide.linker;
 const extensions = syncide.extensions;
 const state_mod = syncide.state;
@@ -22,6 +23,7 @@ fn printHelp(w: *Io.Writer) !void {
         \\  syncide extension list                   List shared extensions (alias: ext ls, --list-extensions)
         \\  syncide extension install <id...>        Install extension(s) to shared store (alias: ext -i, --install-extension)
         \\  syncide extension uninstall <id...>      Remove extension(s) from shared store (alias: ext -u, --uninstall-extension)
+        \\  syncide clean-backups [-f] [ide-id...]   Delete syncide .zip backups with confirmation or --force (alias: clean)
         \\  syncide unlink <ide-id...|all>           Detach IDE(s) back into standalone copies
         \\
         \\Init Options:
@@ -701,6 +703,88 @@ fn handleUnlink(
     });
 }
 
+fn handleCleanBackups(
+    arena: Allocator,
+    io: Io,
+    out: *Io.Writer,
+    p: types.PlatformPaths,
+    args: []const []const u8,
+) !void {
+    var force_flag = false;
+    var ide_filters: std.ArrayList([]const u8) = .empty;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            force_flag = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            return error.UnknownOption;
+        } else if (!std.ascii.eqlIgnoreCase(arg, "all")) {
+            try ide_filters.append(arena, arg);
+        }
+    }
+
+    const discovered = try discovery.discoverIdes(arena, io, p);
+    var targets: std.ArrayList(types.IdeInstallation) = .empty;
+
+    if (ide_filters.items.len == 0) {
+        try targets.appendSlice(arena, discovered);
+    } else {
+        for (discovered) |ide| {
+            for (ide_filters.items) |flt| {
+                if (std.ascii.eqlIgnoreCase(ide.id, flt)) {
+                    try targets.append(arena, ide);
+                    break;
+                }
+            }
+        }
+        if (targets.items.len == 0) {
+            return error.NoMatchingIdeFound;
+        }
+    }
+
+    const backups = try archive.findIdeBackups(arena, io, targets.items);
+    if (backups.len == 0) {
+        try out.writeAll("No syncide backup archives (.zip) found.\n");
+        return;
+    }
+
+    var total_bytes: u64 = 0;
+    for (backups) |b| {
+        total_bytes += b.size;
+    }
+
+    var total_buf: [32]u8 = undefined;
+    const total_str = paths.formatBytesBuf(total_bytes, &total_buf);
+    try out.print("Found {d} backup archive(s) ({s} total):\n", .{ backups.len, total_str });
+
+    for (backups) |b| {
+        var sz_buf: [32]u8 = undefined;
+        const sz_str = paths.formatBytesBuf(b.size, &sz_buf);
+        try out.print("  - [{s:>8}] {s}\n", .{ sz_str, b.path });
+    }
+    try out.writeByte('\n');
+
+    if (!force_flag) {
+        const prompt_msg = try std.fmt.allocPrint(
+            arena,
+            "Permanently delete {d} backup archive(s) ({s})? This cannot be undone",
+            .{ backups.len, total_str },
+        );
+        if (!(try askConfirm(arena, io, out, prompt_msg, false))) {
+            try out.writeAll("Aborted. Backups kept intact.\n");
+            return;
+        }
+    }
+
+    const res = archive.deleteBackupArchives(io, backups);
+    var freed_buf: [32]u8 = undefined;
+    const freed_str = paths.formatBytesBuf(res.freed_bytes, &freed_buf);
+    try out.print("Deleted {d} backup archive(s), freed {s}.\n", .{ res.deleted_count, freed_str });
+    if (res.failed_count > 0) {
+        try out.print("Warning: Failed to delete {d} archive(s).\n", .{res.failed_count});
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
@@ -738,6 +822,11 @@ pub fn main(init: std.process.Init) !void {
             std.ascii.eqlIgnoreCase(cmd, "ext"))
         {
             break :blk handleExtension(arena, io, init.environ_map, out, p, rest);
+        } else if (std.ascii.eqlIgnoreCase(cmd, "clean-backups") or
+            std.ascii.eqlIgnoreCase(cmd, "clean") or
+            std.ascii.eqlIgnoreCase(cmd, "prune-backups"))
+        {
+            break :blk handleCleanBackups(arena, io, out, p, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "unlink")) {
             break :blk handleUnlink(arena, io, out, p, rest);
         } else {

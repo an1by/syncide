@@ -158,6 +158,14 @@ test "end-to-end discovery, zip backups, junction/symlink live sync, broken link
     try archive.createZipPure(gpa, io, pure_zip, custom_store, &.{"User"});
     try std.Io.Dir.accessAbsolute(io, pure_zip, .{});
 
+    // Test backup discovery & cleanup
+    const found_backups = try archive.findIdeBackups(arena, io, ides);
+    try std.testing.expectEqual(@as(usize, 4), found_backups.len);
+    const del_res = archive.deleteBackupArchives(io, found_backups);
+    try std.testing.expectEqual(@as(usize, 4), del_res.deleted_count);
+    const after_backups = try archive.findIdeBackups(arena, io, ides);
+    try std.testing.expectEqual(@as(usize, 0), after_backups.len);
+
     // Test standalone unlink
     const store_paths = try paths.getStorePaths(arena, custom_store);
     try linker.unlinkIde(arena, io, code_ide.?, store_paths);
