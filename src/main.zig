@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const syncide = @import("syncide");
 
 const Allocator = std.mem.Allocator;
@@ -63,28 +64,116 @@ fn printHelp(w: *Io.Writer) !void {
     );
 }
 
-fn readStdinLineAlloc(arena: Allocator, io: Io) ![]const u8 {
-    var line: std.ArrayList(u8) = .empty;
-    const stdin_file = Io.File.stdin();
-    var reader = stdin_file.reader(io, &.{});
-    while (true) {
-        const b = reader.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return reader.err orelse error.InputFailed,
-        };
-        if (b == '\n') {
-            break;
+const ConsoleInput = struct {
+    io: Io,
+    buf: [4096]u8 = undefined,
+    stream_reader: ?Io.File.Reader = null,
+    is_win_console: bool = false,
+
+    pub fn init(io: Io) ConsoleInput {
+        var self: ConsoleInput = .{ .io = io };
+        if (builtin.os.tag == .windows) {
+            const win = struct {
+                extern "kernel32" fn GetConsoleMode(
+                    hConsoleHandle: std.os.windows.HANDLE,
+                    lpMode: *u32,
+                ) callconv(.winapi) i32;
+            };
+            var mode: u32 = 0;
+            if (win.GetConsoleMode(Io.File.stdin().handle, &mode) != 0) {
+                self.is_win_console = true;
+            }
         }
-        if (b != '\r') {
-            try line.append(arena, b);
-        }
+        return self;
     }
-    return std.mem.trim(u8, line.items, " \t");
-}
+
+    pub fn readLineAlloc(self: *ConsoleInput, arena: Allocator) ![]const u8 {
+        if (builtin.os.tag == .windows and self.is_win_console) {
+            const win = struct {
+                extern "kernel32" fn ReadConsoleW(
+                    hConsoleInput: std.os.windows.HANDLE,
+                    lpBuffer: [*]u16,
+                    nNumberOfCharsToRead: u32,
+                    lpNumberOfCharsRead: *u32,
+                    pInputControl: ?*anyopaque,
+                ) callconv(.winapi) i32;
+            };
+
+            var line_utf8: std.ArrayList(u8) = .empty;
+            var wbuf: [1024]u16 = undefined;
+            while (true) {
+                var chars_read: u32 = 0;
+                if (win.ReadConsoleW(
+                    Io.File.stdin().handle,
+                    &wbuf,
+                    @intCast(wbuf.len),
+                    &chars_read,
+                    null,
+                ) == 0) {
+                    return error.InputFailed;
+                }
+                if (chars_read == 0) {
+                    return error.EndOfInput;
+                }
+                const slice_w = wbuf[0..chars_read];
+                var end_w = slice_w.len;
+                var saw_newline = false;
+                for (slice_w, 0..) |wc, idx| {
+                    if (wc == '\n') {
+                        end_w = idx;
+                        saw_newline = true;
+                        break;
+                    }
+                }
+                if (end_w > 0 and slice_w[end_w - 1] == '\r') {
+                    end_w -= 1;
+                }
+                if (end_w > 0) {
+                    const chunk_utf8 = try std.unicode.utf16LeToUtf8Alloc(arena, slice_w[0..end_w]);
+                    try line_utf8.appendSlice(arena, chunk_utf8);
+                }
+                if (saw_newline) {
+                    break;
+                }
+            }
+            return std.mem.trim(u8, line_utf8.items, " \t\r\n");
+        }
+
+        if (self.stream_reader == null) {
+            self.stream_reader = Io.File.stdin().readerStreaming(self.io, &self.buf);
+        }
+        const r = &self.stream_reader.?.interface;
+        var line: std.ArrayList(u8) = .empty;
+        var got_any = false;
+        while (true) {
+            const b = r.takeByte() catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (!got_any) {
+                        return error.EndOfInput;
+                    }
+                    break;
+                },
+                else => return self.stream_reader.?.err orelse error.InputFailed,
+            };
+            got_any = true;
+            if (b == '\n') {
+                break;
+            }
+            if (b != '\r') {
+                try line.append(arena, b);
+            }
+        }
+        var raw_line: []const u8 = line.items;
+        if (std.mem.startsWith(u8, raw_line, "\xEF\xBB\xBF")) {
+            raw_line = raw_line[3..];
+        }
+        return std.mem.trim(u8, raw_line, " \t");
+    }
+};
 
 fn askPrompt(
     arena: Allocator,
-    io: Io,
+    cin: *ConsoleInput,
     out: *Io.Writer,
     question: []const u8,
     default_val: ?[]const u8,
@@ -96,19 +185,19 @@ fn askPrompt(
     }
     try out.flush();
 
-    const ans = try readStdinLineAlloc(arena, io);
+    const ans = try cin.readLineAlloc(arena);
     if (ans.len == 0 and default_val != null) {
         return default_val.?;
     }
     return ans;
 }
 
-fn askConfirm(arena: Allocator, io: Io, out: *Io.Writer, question: []const u8, default_yes: bool) !bool {
+fn askConfirm(arena: Allocator, cin: *ConsoleInput, out: *Io.Writer, question: []const u8, default_yes: bool) !bool {
     const hint = if (default_yes) "Y/n" else "y/N";
     try out.print("{s} [{s}]: ", .{ question, hint });
     try out.flush();
 
-    const ans = try readStdinLineAlloc(arena, io);
+    const ans = try cin.readLineAlloc(arena);
     if (ans.len == 0) {
         return default_yes;
     }
@@ -122,7 +211,7 @@ fn askConfirm(arena: Allocator, io: Io, out: *Io.Writer, question: []const u8, d
 
 fn askOneIndex(
     arena: Allocator,
-    io: Io,
+    cin: *ConsoleInput,
     out: *Io.Writer,
     question: []const u8,
     max_count: usize,
@@ -132,7 +221,7 @@ fn askOneIndex(
     const def_str = try std.fmt.bufPrint(&def_buf, "{d}", .{default_one_based});
 
     while (true) {
-        const raw = try askPrompt(arena, io, out, question, def_str);
+        const raw = try askPrompt(arena, cin, out, question, def_str);
         if (std.fmt.parseInt(usize, raw, 10)) |num| {
             if (num >= 1 and num <= max_count) {
                 return num - 1;
@@ -213,13 +302,13 @@ pub fn parseSelectionIndicesAlloc(arena: Allocator, raw_input: []const u8, max_c
 
 fn askManyIndices(
     arena: Allocator,
-    io: Io,
+    cin: *ConsoleInput,
     out: *Io.Writer,
     question: []const u8,
     max_count: usize,
 ) ![]usize {
     while (true) {
-        const raw = try askPrompt(arena, io, out, question, "all");
+        const raw = try askPrompt(arena, cin, out, question, "all");
         if (parseSelectionIndicesAlloc(arena, raw, max_count)) |indices| {
             return indices;
         } else |_| {
@@ -330,6 +419,7 @@ fn handleInit(
     arena: Allocator,
     gpa: Allocator,
     io: Io,
+    cin: *ConsoleInput,
     environ_map: *const std.process.Environ.Map,
     out: *Io.Writer,
     p: types.PlatformPaths,
@@ -425,7 +515,7 @@ fn handleInit(
     } else {
         const chosen_indices = try askManyIndices(
             arena,
-            io,
+            cin,
             out,
             "Select IDEs to synchronize ('all', '1,2,5', '1-3', or '-4' to exclude)",
             discovered.len,
@@ -457,7 +547,7 @@ fn handleInit(
         else
             try askOneIndex(
                 arena,
-                io,
+                cin,
                 out,
                 "Select primary (base) IDE configuration (number)",
                 selected_list.items.len,
@@ -468,7 +558,7 @@ fn handleInit(
         if (selected_list.items.len > 1) {
             merge_extensions = try askConfirm(
                 arena,
-                io,
+                cin,
                 out,
                 "Merge unique extensions from other selected IDEs into primary set?",
                 merge_flag,
@@ -476,7 +566,7 @@ fn handleInit(
         }
 
         const default_store = store_arg orelse (if (existing_state) |es| es.storeDir else p.default_store_dir);
-        const store_input = try askPrompt(arena, io, out, "Central store directory", default_store);
+        const store_input = try askPrompt(arena, cin, out, "Central store directory", default_store);
         store_dir = try paths.resolveUserInputPath(arena, io, store_input);
 
         try out.print("\nPlan:\n  Primary IDE:      {s} ({s})\n  Target IDEs:      ", .{
@@ -494,7 +584,7 @@ fn handleInit(
             .{ if (merge_extensions) "yes" else "no", store_dir },
         );
 
-        if (!(try askConfirm(arena, io, out, "Proceed with backup & linking?", true))) {
+        if (!(try askConfirm(arena, cin, out, "Proceed with backup & linking?", true))) {
             try out.writeAll("Aborted.\n");
             return;
         }
@@ -509,6 +599,7 @@ fn handleInit(
         .primary_ide = primary_ide,
         .store_dir = store_dir,
         .merge_extensions = merge_extensions,
+        .progress_out = out,
     });
     try printSyncSummary(out, summary);
 }
@@ -750,6 +841,7 @@ fn handleBackups(
     arena: Allocator,
     gpa: Allocator,
     io: Io,
+    cin: *ConsoleInput,
     environ_map: *const std.process.Environ.Map,
     out: *Io.Writer,
     p: types.PlatformPaths,
@@ -893,7 +985,7 @@ fn handleBackups(
                     "Permanently delete {d} backup archive(s) ({s})? This cannot be undone",
                     .{ backups.len, total_str },
                 );
-                if (!(try askConfirm(arena, io, out, prompt_msg, false))) {
+                if (!(try askConfirm(arena, cin, out, prompt_msg, false))) {
                     try out.writeAll("Aborted. Backups kept intact.\n");
                     return;
                 }
@@ -1061,6 +1153,7 @@ fn handleUpdate(
 fn handleUninstall(
     arena: Allocator,
     io: Io,
+    cin: *ConsoleInput,
     environ_map: *const std.process.Environ.Map,
     out: *Io.Writer,
     p: types.PlatformPaths,
@@ -1127,7 +1220,7 @@ fn handleUninstall(
         );
         const choice_idx = try askOneIndex(
             arena,
-            io,
+            cin,
             out,
             "Select restore mode (1 or 2)",
             2,
@@ -1151,7 +1244,7 @@ fn handleUninstall(
         else
             "Proceed with removing syncide binary, store, and PATH entry?";
 
-        if (!(try askConfirm(arena, io, out, confirm_q, false))) {
+        if (!(try askConfirm(arena, cin, out, confirm_q, false))) {
             try out.writeAll("Aborted.\n");
             return;
         }
@@ -1212,8 +1305,9 @@ pub fn main(init: std.process.Init) !void {
     const cli_args = if (raw_args.len > 1) raw_args[1..] else &[_][]const u8{};
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    var stdout_fw: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buf);
     const out = &stdout_fw.interface;
+    var cin = ConsoleInput.init(io);
 
     for (cli_args) |a| {
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "help")) {
@@ -1239,7 +1333,7 @@ pub fn main(init: std.process.Init) !void {
 
     const runResult: anyerror!void = blk: {
         if (std.ascii.eqlIgnoreCase(cmd, "init") or std.ascii.eqlIgnoreCase(cmd, "setup")) {
-            break :blk handleInit(arena, gpa, io, init.environ_map, out, p, rest);
+            break :blk handleInit(arena, gpa, io, &cin, init.environ_map, out, p, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "status") or std.ascii.eqlIgnoreCase(cmd, "scan")) {
             const ides = try discovery.discoverIdes(arena, io, p);
             break :blk printStatusTable(arena, io, out, p, ides);
@@ -1251,14 +1345,14 @@ pub fn main(init: std.process.Init) !void {
         {
             break :blk handleExtension(arena, io, init.environ_map, out, p, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "backups") or std.ascii.eqlIgnoreCase(cmd, "backup")) {
-            break :blk handleBackups(arena, gpa, io, init.environ_map, out, p, rest);
+            break :blk handleBackups(arena, gpa, io, &cin, init.environ_map, out, p, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "update") or
             std.ascii.eqlIgnoreCase(cmd, "self-update") or
             std.ascii.eqlIgnoreCase(cmd, "upgrade"))
         {
             break :blk handleUpdate(arena, io, init.environ_map, out, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "uninstall") or std.ascii.eqlIgnoreCase(cmd, "self-uninstall")) {
-            break :blk handleUninstall(arena, io, init.environ_map, out, p, rest);
+            break :blk handleUninstall(arena, io, &cin, init.environ_map, out, p, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "unlink")) {
             break :blk handleUnlink(arena, io, out, p, rest);
         } else {
@@ -1269,6 +1363,11 @@ pub fn main(init: std.process.Init) !void {
     };
 
     runResult catch |err| {
+        if (err == error.EndOfInput) {
+            try out.writeAll("\nAborted (end of input).\n");
+            try out.flush();
+            std.process.exit(1);
+        }
         try out.flush();
         if (err == error.NotInitialized) {
             std.debug.print("Error: syncide is not initialized yet. Run 'syncide init' first.\n", .{});

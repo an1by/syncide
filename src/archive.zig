@@ -327,7 +327,17 @@ pub fn createCompressedZip(
         if (Dir.accessAbsolute(io, tar_exe, .{})) |_| {
             var argv: std.ArrayList([]const u8) = .empty;
             defer argv.deinit(gpa);
-            try argv.appendSlice(gpa, &.{ tar_exe, "-a", "-c", "-f", zip_path, "-C", base_dir });
+            try argv.appendSlice(gpa, &.{
+                tar_exe,
+                "-a",
+                "-c",
+                "--options",
+                "zip:compression-level=1",
+                "-f",
+                zip_path,
+                "-C",
+                base_dir,
+            });
             try argv.appendSlice(gpa, rel_targets);
 
             var child = std.process.spawn(io, .{
@@ -351,7 +361,7 @@ pub fn createCompressedZip(
     } else {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{ "zip", "-r", "-q", zip_path });
+        try argv.appendSlice(gpa, &.{ "zip", "-1", "-r", "-q", zip_path });
         try argv.appendSlice(gpa, rel_targets);
 
         var child = std.process.spawn(io, .{

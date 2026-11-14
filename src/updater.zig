@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 
-pub const VERSION = "0.4.0";
+pub const VERSION = "0.4.1";
 pub const REPO = "an1by/syncide";
 
 pub const UpdateOptions = struct {

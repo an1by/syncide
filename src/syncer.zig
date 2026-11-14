@@ -17,6 +17,7 @@ pub const InitSyncOptions = struct {
     primary_ide: types.IdeInstallation,
     store_dir: []const u8,
     merge_extensions: bool,
+    progress_out: ?*Io.Writer = null,
 };
 
 pub const SyncSummary = struct {
@@ -93,7 +94,16 @@ pub fn initializeSync(
     var seen_dot_dirs: std.ArrayList([]const u8) = .empty;
 
     // 1. Create compressed .zip backups inside each IDE's own folders BEFORE mutating links
-    for (managed.items) |ide| {
+    for (managed.items, 0..) |ide, idx| {
+        if (opts.progress_out) |pw| {
+            try pw.print("  [{d}/{d}] Backing up {s} ({s})...\n", .{
+                idx + 1,
+                managed.items.len,
+                ide.name,
+                ide.id,
+            });
+            try pw.flush();
+        }
         if (!containsPath(seen_app_dirs.items, ide.app_dir)) {
             try seen_app_dirs.append(arena, ide.app_dir);
             if (try archive.backupIdeUserConfig(arena, gpa, io, environ_map, ide, ts_slug)) |zip_p| {
@@ -109,6 +119,10 @@ pub fn initializeSync(
     }
 
     // 2. Populate central store from Primary IDE (+ optional unique extensions from other IDEs)
+    if (opts.progress_out) |pw| {
+        try pw.print("  Populating central store from {s}...\n", .{opts.primary_ide.name});
+        try pw.flush();
+    }
     try Dir.cwd().createDirPath(io, store.user_dir);
     try Dir.cwd().createDirPath(io, store.extensions_dir);
 
