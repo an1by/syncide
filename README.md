@@ -18,7 +18,17 @@ curl -fsSL https://raw.githubusercontent.com/an1by/syncide/main/install.sh | sh
 
 ### Uninstall
 
-Safely detaches all linked IDEs back into standalone copies (`syncide unlink all`), cleans `PATH`, and removes `syncide`:
+Interactive uninstall lets you choose how linked IDEs are restored before removing the store, `PATH` entry, and `syncide` binary:
+1. **Rollback from backups (default)** — unpacks each IDE's `.zip` backups if available (falls back to copying shared config if backups were cleaned).
+2. **Duplicate shared config** — keeps the current unified settings, keybindings & extensions duplicated across all IDEs.
+
+```sh
+syncide uninstall                  # Interactive choice (1: rollback / 2: duplicate) + confirmation
+syncide uninstall -f               # Force uninstall with default mode 1 (rollback from .zip backups)
+syncide uninstall -f --duplicate   # Force uninstall with mode 2 (duplicate shared config everywhere)
+```
+
+Or via standalone one-liners:
 
 **Windows (PowerShell):**
 
@@ -75,6 +85,10 @@ syncide backups clean -f cursor
 # Self-update syncide binary from GitHub Releases (verifies SHA-256)
 syncide update
 syncide update --check
+
+# Uninstall syncide (prompts mode 1: rollback .zip backups / mode 2: duplicate shared config)
+syncide uninstall
+syncide uninstall -f
 
 # Safely detach an IDE back into standalone copies
 syncide unlink cursor

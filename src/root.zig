@@ -9,10 +9,12 @@ pub const extensions = @import("extensions.zig");
 pub const state = @import("state.zig");
 pub const syncer = @import("syncer.zig");
 pub const updater = @import("updater.zig");
+pub const uninstaller = @import("uninstaller.zig");
 pub const VERSION = updater.VERSION;
 
 test {
     _ = updater;
+    _ = uninstaller;
 }
 
 fn writeDummyExt(
@@ -215,4 +217,156 @@ test "end-to-end discovery, zip backups, junction/symlink live sync, broken link
     try linker.unlinkIde(arena, io, code_ide.?, store_paths);
     const code_ext_stat = try std.Io.Dir.cwd().statFile(io, code_ide.?.extensions_dir, .{ .follow_symlinks = false });
     try std.testing.expectEqual(std.Io.File.Kind.directory, code_ext_stat.kind);
+}
+
+test "uninstall restore modes: rollback from zip backups, fallback without backups, and duplicate shared" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, arena);
+    const rand_ns = std.Io.Clock.awake.now(io).nanoseconds;
+    const sandbox_name = try std.fmt.allocPrint(arena, ".zig-cache/syncide-uninst-{d}", .{rand_ns});
+    const sandbox = try std.Io.Dir.path.resolve(arena, &.{ cwd_abs, sandbox_name });
+    defer std.Io.Dir.cwd().deleteTree(io, sandbox) catch {};
+
+    const fake_home = try std.Io.Dir.path.join(arena, &.{ sandbox, "home" });
+    const fake_appdata = try std.Io.Dir.path.join(arena, &.{ sandbox, "appdata" });
+    try std.Io.Dir.cwd().createDirPath(io, fake_home);
+    try std.Io.Dir.cwd().createDirPath(io, fake_appdata);
+
+    // Seed VS Code + Cursor with distinct initial configs and extensions
+    const code_user = try std.Io.Dir.path.join(arena, &.{ fake_appdata, "Code", "User" });
+    try std.Io.Dir.cwd().createDirPath(io, code_user);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.Io.Dir.path.join(arena, &.{ code_user, "settings.json" }),
+        .data = "{\"theme\":\"v-orig\"}",
+    });
+    try writeDummyExt(
+        arena,
+        io,
+        try std.Io.Dir.path.join(arena, &.{ fake_home, ".vscode", "extensions" }),
+        "esbenp",
+        "prettier-vscode",
+        "10.1.0",
+    );
+
+    const cursor_user = try std.Io.Dir.path.join(arena, &.{ fake_appdata, "Cursor", "User" });
+    try std.Io.Dir.cwd().createDirPath(io, cursor_user);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.Io.Dir.path.join(arena, &.{ cursor_user, "settings.json" }),
+        .data = "{\"theme\":\"c-orig\"}",
+    });
+    try writeDummyExt(
+        arena,
+        io,
+        try std.Io.Dir.path.join(arena, &.{ fake_home, ".cursor", "extensions" }),
+        "biomejs",
+        "biome",
+        "2.0.0",
+    );
+
+    const p = try paths.resolvePlatformPaths(arena, &env_map, .{
+        .home_dir = fake_home,
+        .app_config_root = fake_appdata,
+    });
+    const ides = try discovery.discoverIdes(arena, io, p);
+    try std.testing.expectEqual(@as(usize, 2), ides.len);
+
+    var cursor_ide: types.IdeInstallation = undefined;
+    var code_ide: types.IdeInstallation = undefined;
+    for (ides) |ide| {
+        if (std.mem.eql(u8, ide.id, "cursor")) {
+            cursor_ide = ide;
+        } else {
+            code_ide = ide;
+        }
+    }
+
+    const store1 = try std.Io.Dir.path.join(arena, &.{ sandbox, "store1" });
+    _ = try syncer.initializeSync(arena, gpa, io, &env_map, .{
+        .platform_paths = p,
+        .selected_ides = ides,
+        .primary_ide = cursor_ide,
+        .store_dir = store1,
+        .merge_extensions = true,
+    });
+
+    // Mutate live shared settings after init
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cursor_ide.settings_path,
+        .data = "{\"theme\":\"unified-live\"}",
+    });
+
+    // Case 1: Mode 1 (.rollback_backups) WITH .zip backups -> restores each IDE's original pre-init files
+    const sum1 = try uninstaller.restoreIdesAndRemoveStore(arena, io, p, null, .rollback_backups);
+    try std.testing.expectEqual(@as(usize, 2), sum1.outcomes.len);
+    for (sum1.outcomes) |o| {
+        try std.testing.expect(o.user_from_backup);
+        try std.testing.expect(o.ext_from_backup);
+    }
+
+    const code_s1 = try std.Io.Dir.cwd().readFileAlloc(io, code_ide.settings_path, arena, .limited(1024));
+    const cursor_s1 = try std.Io.Dir.cwd().readFileAlloc(io, cursor_ide.settings_path, arena, .limited(1024));
+    try std.testing.expectEqualStrings("{\"theme\":\"v-orig\"}", code_s1);
+    try std.testing.expectEqualStrings("{\"theme\":\"c-orig\"}", cursor_s1);
+
+    // Clean old backups, re-init, delete newly created backups, then test Mode 1 fallback (no backups)
+    const old_baks = try archive.findIdeBackups(arena, io, ides);
+    _ = archive.deleteBackupArchives(io, old_baks);
+
+    const ides2 = try discovery.discoverIdes(arena, io, p);
+    const store2 = try std.Io.Dir.path.join(arena, &.{ sandbox, "store2" });
+    _ = try syncer.initializeSync(arena, gpa, io, &env_map, .{
+        .platform_paths = p,
+        .selected_ides = ides2,
+        .primary_ide = cursor_ide,
+        .store_dir = store2,
+        .merge_extensions = true,
+    });
+    const baks2 = try archive.findIdeBackups(arena, io, ides2);
+    _ = archive.deleteBackupArchives(io, baks2);
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = code_ide.settings_path,
+        .data = "{\"theme\":\"fallback-shared\"}",
+    });
+
+    const sum2 = try uninstaller.restoreIdesAndRemoveStore(arena, io, p, null, .rollback_backups);
+    for (sum2.outcomes) |o| {
+        try std.testing.expect(!o.user_from_backup);
+        try std.testing.expect(!o.ext_from_backup);
+    }
+    const code_s2 = try std.Io.Dir.cwd().readFileAlloc(io, code_ide.settings_path, arena, .limited(1024));
+    const cursor_s2 = try std.Io.Dir.cwd().readFileAlloc(io, cursor_ide.settings_path, arena, .limited(1024));
+    try std.testing.expectEqualStrings("{\"theme\":\"fallback-shared\"}", code_s2);
+    try std.testing.expectEqualStrings("{\"theme\":\"fallback-shared\"}", cursor_s2);
+
+    // Case 3: Mode 2 (.duplicate_shared) WITH backups present -> duplicates unified config everywhere
+    const ides3 = try discovery.discoverIdes(arena, io, p);
+    const store3 = try std.Io.Dir.path.join(arena, &.{ sandbox, "store3" });
+    _ = try syncer.initializeSync(arena, gpa, io, &env_map, .{
+        .platform_paths = p,
+        .selected_ides = ides3,
+        .primary_ide = cursor_ide,
+        .store_dir = store3,
+        .merge_extensions = true,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cursor_ide.settings_path,
+        .data = "{\"theme\":\"duplicated-shared\"}",
+    });
+
+    const sum3 = try uninstaller.restoreIdesAndRemoveStore(arena, io, p, null, .duplicate_shared);
+    try std.testing.expectEqual(@as(usize, 2), sum3.outcomes.len);
+    const code_s3 = try std.Io.Dir.cwd().readFileAlloc(io, code_ide.settings_path, arena, .limited(1024));
+    const cursor_s3 = try std.Io.Dir.cwd().readFileAlloc(io, cursor_ide.settings_path, arena, .limited(1024));
+    try std.testing.expectEqualStrings("{\"theme\":\"duplicated-shared\"}", code_s3);
+    try std.testing.expectEqualStrings("{\"theme\":\"duplicated-shared\"}", cursor_s3);
 }

@@ -218,7 +218,7 @@ pub fn inspectIdeLinks(
     };
 }
 
-fn removeLinkOnly(io: Io, link_path: []const u8) void {
+pub fn removeLinkOnly(io: Io, link_path: []const u8) void {
     Dir.deleteFileAbsolute(io, link_path) catch {
         Dir.deleteDirAbsolute(io, link_path) catch {};
     };

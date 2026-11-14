@@ -12,6 +12,7 @@ const extensions = syncide.extensions;
 const state_mod = syncide.state;
 const syncer = syncide.syncer;
 const updater = syncide.updater;
+const uninstaller = syncide.uninstaller;
 
 fn printHelp(w: *Io.Writer) !void {
     try w.writeAll(
@@ -29,6 +30,7 @@ fn printHelp(w: *Io.Writer) !void {
         \\  syncide backups list [ide-id...|all]     List existing .zip backups and sizes (default for 'backups')
         \\  syncide unlink <ide-id...|all>           Detach IDE(s) back into standalone copies
         \\  syncide update [-f] [--check]            Self-update syncide binary from GitHub Releases
+        \\  syncide uninstall [-f] [mode]            Restore IDEs (1: rollback backups / 2: duplicate shared) & remove syncide
         \\  syncide --version                        Print installed syncide version
         \\
         \\Init Options:
@@ -44,8 +46,13 @@ fn printHelp(w: *Io.Writer) !void {
         \\
         \\Update Options:
         \\  --check              Check whether a newer release is available without installing
-        \\  --version <tag>      Install a specific release version (e.g. v0.3.0)
+        \\  --version <tag>      Install a specific release version (e.g. v0.4.0)
         \\  -f, --force          Reinstall even if already on the latest version
+        \\
+        \\Uninstall Options:
+        \\  -f, --force          Non-interactive uninstall (defaults to mode 1: rollback from backups)
+        \\  --rollback           Mode 1 (default): unpack IDE .zip backups if present (fallback: shared copy)
+        \\  --duplicate          Mode 2: duplicate current shared settings & extensions into every IDE
         \\
         \\Extension Options:
         \\  -l, --list-extensions          List installed extensions in shared store
@@ -1051,6 +1058,149 @@ fn handleUpdate(
     try updater.runSelfUpdate(arena, io, environ_map, out, opts);
 }
 
+fn handleUninstall(
+    arena: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    out: *Io.Writer,
+    p: types.PlatformPaths,
+    args: []const []const u8,
+) !void {
+    var force_flag = false;
+    var store_arg: ?[]const u8 = null;
+    var explicit_mode: ?uninstaller.RestoreMode = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+            force_flag = true;
+        } else if (std.mem.eql(u8, arg, "--rollback") or std.mem.eql(u8, arg, "-1")) {
+            explicit_mode = .rollback_backups;
+        } else if (std.mem.eql(u8, arg, "--duplicate") or
+            std.mem.eql(u8, arg, "--keep-shared") or
+            std.mem.eql(u8, arg, "-2"))
+        {
+            explicit_mode = .duplicate_shared;
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            i += 1;
+            if (i >= args.len) {
+                return error.MissingOptionValue;
+            }
+            store_arg = try paths.resolveUserInputPath(arena, io, args[i]);
+        } else {
+            return error.UnknownOption;
+        }
+    }
+
+    const exe_path = try std.process.executablePathAlloc(io, arena);
+    const plan = try uninstaller.inspectUninstallPlan(arena, io, p, store_arg);
+
+    try out.print("syncide uninstall:\n  Binary:      {s}\n", .{exe_path});
+    if (plan.store_dir) |sd| {
+        try out.print("  Store:       {s}\n", .{sd});
+    }
+    if (plan.linked_ides.len > 0) {
+        try out.writeAll("  Linked IDEs: ");
+        for (plan.linked_ides, 0..) |ide, idx| {
+            if (idx > 0) {
+                try out.writeAll(", ");
+            }
+            try out.writeAll(ide.name);
+        }
+        try out.print(" ({d} IDE .zip backup(s) found)\n\n", .{plan.ide_backup_count});
+    } else {
+        try out.writeAll("  Linked IDEs: none\n\n");
+    }
+
+    var mode: uninstaller.RestoreMode = explicit_mode orelse .rollback_backups;
+
+    if (plan.linked_ides.len > 0 and explicit_mode == null and !force_flag) {
+        try out.writeAll(
+            \\Choose how linked IDEs should be restored before uninstalling:
+            \\  [1] Rollback from backups (default) — unpack each IDE's .zip backups if available;
+            \\      if an IDE has no backup archive, current shared settings & extensions are copied instead
+            \\  [2] Duplicate shared config — keep current unified settings, keybindings & extensions
+            \\      duplicated across all IDEs as standalone copies
+            \\
+            \\
+        );
+        const choice_idx = try askOneIndex(
+            arena,
+            io,
+            out,
+            "Select restore mode (1 or 2)",
+            2,
+            1,
+        );
+        mode = if (choice_idx == 0) .rollback_backups else .duplicate_shared;
+        try out.writeByte('\n');
+    }
+
+    if (!force_flag) {
+        const mode_desc = switch (mode) {
+            .rollback_backups => "mode 1: rollback from backups where available",
+            .duplicate_shared => "mode 2: duplicate current shared config everywhere",
+        };
+        const confirm_q = if (plan.linked_ides.len > 0)
+            try std.fmt.allocPrint(
+                arena,
+                "Proceed with full syncide uninstall ({s})?",
+                .{mode_desc},
+            )
+        else
+            "Proceed with removing syncide binary, store, and PATH entry?";
+
+        if (!(try askConfirm(arena, io, out, confirm_q, false))) {
+            try out.writeAll("Aborted.\n");
+            return;
+        }
+        try out.writeByte('\n');
+    }
+
+    if (plan.linked_ides.len > 0) {
+        switch (mode) {
+            .rollback_backups => {
+                try out.writeAll(
+                    "Restoring IDEs via [1] Rollback from .zip backups (fallback: shared copies)...\n",
+                );
+            },
+            .duplicate_shared => {
+                try out.writeAll(
+                    "Restoring IDEs via [2] Duplicating current shared configuration everywhere...\n",
+                );
+            },
+        }
+        try out.flush();
+    }
+
+    const res = try uninstaller.restoreIdesAndRemoveStore(arena, io, p, store_arg, mode);
+    for (res.outcomes) |item| {
+        const u_label = if (item.user_from_backup) ".zip backup" else "shared copy";
+        const e_label = if (item.ext_from_backup) ".zip backup" else "shared copy";
+        try out.print("  + {s} ({s}): user={s}, extensions={s}\n", .{
+            item.ide_name,
+            item.ide_id,
+            u_label,
+            e_label,
+        });
+    }
+
+    for (res.removed_store_dirs) |sd| {
+        try out.print("Removed store directory: {s}\n", .{sd});
+    }
+    for (res.warnings) |w| {
+        try out.print("Warning: {s}\n", .{w});
+    }
+
+    if (uninstaller.cleanSystemPath(arena, io, environ_map, p, exe_path)) {
+        try out.writeAll("Cleaned syncide from user PATH.\n");
+    }
+
+    try uninstaller.scheduleOrRemoveBinary(arena, io, environ_map, exe_path);
+    try out.print("Removed syncide binary: {s}\n", .{exe_path});
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
@@ -1107,6 +1257,8 @@ pub fn main(init: std.process.Init) !void {
             std.ascii.eqlIgnoreCase(cmd, "upgrade"))
         {
             break :blk handleUpdate(arena, io, init.environ_map, out, rest);
+        } else if (std.ascii.eqlIgnoreCase(cmd, "uninstall") or std.ascii.eqlIgnoreCase(cmd, "self-uninstall")) {
+            break :blk handleUninstall(arena, io, init.environ_map, out, p, rest);
         } else if (std.ascii.eqlIgnoreCase(cmd, "unlink")) {
             break :blk handleUnlink(arena, io, out, p, rest);
         } else {
@@ -1125,9 +1277,9 @@ pub fn main(init: std.process.Init) !void {
                 "Error: Unknown backups subcommand. Expected 'syncide backups create', 'syncide backups clean', or 'syncide backups list'.\n",
                 .{},
             );
-        } else if (err == error.UpdatePermissionDenied) {
+        } else if (err == error.UpdatePermissionDenied or err == error.UninstallPermissionDenied) {
             std.debug.print(
-                "Error: Permission denied updating syncide executable. Re-run from an elevated terminal (or sudo).\n",
+                "Error: Permission denied modifying syncide executable. Re-run from an elevated terminal (or sudo).\n",
                 .{},
             );
         } else if (err == error.ChecksumMismatch) {

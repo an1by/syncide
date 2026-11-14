@@ -761,3 +761,105 @@ pub fn deleteBackupArchives(io: Io, backups: []const BackupArchiveInfo) DeleteBa
     };
 }
 
+pub fn findLatestCategoryBackupAlloc(
+    arena: Allocator,
+    io: Io,
+    dir_path: []const u8,
+    category: []const u8,
+) !?[]const u8 {
+    const prefix = try std.fmt.allocPrint(arena, "syncide-backup-{s}-", .{category});
+    var dir = Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var best_name: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) {
+            continue;
+        }
+        if (!std.mem.startsWith(u8, entry.name, prefix) or !std.ascii.endsWithIgnoreCase(entry.name, ".zip")) {
+            continue;
+        }
+        const full_p = try Dir.path.join(arena, &.{ dir_path, entry.name });
+        const st = Dir.cwd().statFile(io, full_p, .{ .follow_symlinks = false }) catch continue;
+        if (st.kind != .file or st.size < 22) {
+            continue;
+        }
+        if (best_name == null or std.mem.order(u8, entry.name, best_name.?) == .gt) {
+            best_name = try arena.dupe(u8, entry.name);
+        }
+    }
+
+    if (best_name) |bn| {
+        return try Dir.path.join(arena, &.{ dir_path, bn });
+    }
+    return null;
+}
+
+fn isSafeZipEntryPath(rel_path: []const u8) bool {
+    if (rel_path.len == 0 or rel_path[0] == '/' or rel_path[0] == '\\') {
+        return false;
+    }
+    if (std.mem.indexOfScalar(u8, rel_path, ':') != null) {
+        return false;
+    }
+    var it = std.mem.splitScalar(u8, rel_path, '/');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn extractZipOverwrite(io: Io, zip_path: []const u8, dest_dir_path: []const u8) !void {
+    try Dir.cwd().createDirPath(io, dest_dir_path);
+    var dest_dir = try Dir.openDirAbsolute(io, dest_dir_path, .{});
+    defer dest_dir.close(io);
+
+    var zip_file = try Dir.openFileAbsolute(io, zip_path, .{});
+    defer zip_file.close(io);
+
+    var read_buf: [16384]u8 = undefined;
+    var fr = zip_file.reader(io, &read_buf);
+    var iter = try zip.Iterator.init(&fr);
+
+    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const opts: zip.ExtractOptions = .{ .allow_backslashes = true };
+
+    while (try iter.next()) |entry| {
+        const filename = try entry.getFilename(&fr, &filename_buf, opts);
+        if (!isSafeZipEntryPath(filename)) {
+            return error.UnsafeZipEntryPath;
+        }
+
+        if (filename[filename.len - 1] == '/') {
+            const trimmed = filename[0 .. filename.len - 1];
+            if (trimmed.len > 0) {
+                try dest_dir.createDirPath(io, trimmed);
+            }
+            continue;
+        }
+
+        const out_file = blk: {
+            if (std.mem.lastIndexOfScalar(u8, filename, '/')) |slash_idx| {
+                const parent_rel = filename[0..slash_idx];
+                const base_name = filename[slash_idx + 1 ..];
+                var parent_dir = try dest_dir.createDirPathOpen(io, parent_rel, .{});
+                defer parent_dir.close(io);
+                break :blk try parent_dir.createFile(io, base_name, .{ .truncate = true });
+            }
+            break :blk try dest_dir.createFile(io, filename, .{ .truncate = true });
+        };
+        defer out_file.close(io);
+
+        var write_buf: [16384]u8 = undefined;
+        var fw = out_file.writer(io, &write_buf);
+        entry.extractTo(&fr, &fw.interface) catch |err| switch (err) {
+            error.WriteFailed => return fw.err orelse err,
+            else => return err,
+        };
+        try fw.end();
+    }
+}
+

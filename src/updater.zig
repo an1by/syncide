@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 
-pub const VERSION = "0.3.0";
+pub const VERSION = "0.4.0";
 pub const REPO = "an1by/syncide";
 
 pub const UpdateOptions = struct {
@@ -153,14 +153,51 @@ pub fn computeFileSha256Hex(io: Io, file_path: []const u8) ![64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-/// Best-effort cleanup of `<exe>.old` left behind by a previous Windows self-update.
+/// Renames a file (including a currently executing `.exe` on Windows via Win32 `MoveFileExW`,
+/// avoiding `NtOpenFile` `FILE_SHARE_READ` `FileBusy` errors in stdlib `Dir.renameAbsolute`).
+pub fn moveExecutableOrFile(io: Io, src_path: []const u8, dst_path: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        const win = struct {
+            const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+            extern "kernel32" fn MoveFileExW(
+                lpExistingFileName: [*:0]const u16,
+                lpNewFileName: ?[*:0]const u16,
+                dwFlags: u32,
+            ) callconv(.winapi) i32;
+        };
+
+        var src_w: [4096:0]u16 = undefined;
+        const src_len = try std.unicode.utf8ToUtf16Le(&src_w, src_path);
+        src_w[src_len] = 0;
+
+        var dst_w: [4096:0]u16 = undefined;
+        const dst_len = try std.unicode.utf8ToUtf16Le(&dst_w, dst_path);
+        dst_w[dst_len] = 0;
+
+        if (win.MoveFileExW(&src_w, &dst_w, win.MOVEFILE_REPLACE_EXISTING) != 0) {
+            return;
+        }
+        return error.UpdatePermissionDenied;
+    }
+
+    Dir.renameAbsolute(src_path, dst_path, io) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.UpdatePermissionDenied,
+        else => return err,
+    };
+}
+
+/// Best-effort cleanup of `<exe>.old` or `<exe>.uninstall` left behind on Windows.
 pub fn cleanupOldExecutable(arena: Allocator, io: Io) void {
     if (builtin.os.tag != .windows) {
         return;
     }
     const exe_path = std.process.executablePathAlloc(io, arena) catch return;
-    const old_path = std.fmt.allocPrint(arena, "{s}.old", .{exe_path}) catch return;
-    Dir.deleteFileAbsolute(io, old_path) catch {};
+    if (std.fmt.allocPrint(arena, "{s}.old", .{exe_path})) |old_path| {
+        Dir.deleteFileAbsolute(io, old_path) catch {};
+    } else |_| {}
+    if (std.fmt.allocPrint(arena, "{s}.uninstall", .{exe_path})) |uninst_path| {
+        Dir.deleteFileAbsolute(io, uninst_path) catch {};
+    } else |_| {}
 }
 
 fn escapePsSingleQuotedAlloc(arena: Allocator, input: []const u8) ![]const u8 {
@@ -473,13 +510,10 @@ pub fn runSelfUpdate(
         const old_exe = try std.fmt.allocPrint(arena, "{s}.old", .{exe_path});
         Dir.deleteFileAbsolute(io, old_exe) catch {};
 
-        Dir.renameAbsolute(exe_path, old_exe, io) catch |err| switch (err) {
-            error.AccessDenied, error.PermissionDenied => return error.UpdatePermissionDenied,
-            else => return err,
-        };
+        try moveExecutableOrFile(io, exe_path, old_exe);
 
-        Dir.renameAbsolute(asset_path, exe_path, io) catch |err| {
-            Dir.renameAbsolute(old_exe, exe_path, io) catch {};
+        moveExecutableOrFile(io, asset_path, exe_path) catch |err| {
+            moveExecutableOrFile(io, old_exe, exe_path) catch {};
             return err;
         };
 
